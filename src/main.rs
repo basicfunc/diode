@@ -4,7 +4,7 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     path::PathBuf,
-    thread,
+    thread::{spawn, JoinHandle},
 };
 
 use argh::FromArgs;
@@ -37,15 +37,16 @@ struct Diode {
 
 impl Diode {
     fn run(self) -> Result<Status, Error> {
+        type ThreadResult = JoinHandle<Result<usize, Error>>;
+
         let mut message_bus: Bus<Vec<u8>> = Bus::new(self.block_buffer);
-        let input_path = self.input.clone();
         let outputs = self.output.clone();
 
-        let writer_threads: Vec<thread::JoinHandle<Result<(), Error>>> = outputs
+        let writer_threads: Vec<ThreadResult> = outputs
             .into_iter()
             .map(|output_path| {
                 let mut recv = message_bus.add_rx();
-                thread::spawn(move || {
+                spawn(move || {
                     let mut file = File::create(&output_path)
                         .map_err(|_| Error::UnableToCreateFile(output_path))?;
 
@@ -62,40 +63,36 @@ impl Diode {
                         }
                     }
 
-                    Ok(())
+                    Ok(0)
                 })
             })
             .collect();
 
-        let reader_thread: thread::JoinHandle<Result<usize, Error>> = thread::spawn(move || {
+        let reader_thread: ThreadResult = spawn(move || {
             let mut file =
-                File::open(&input_path).map_err(|_| Error::UnableToOpenFile(input_path.clone()))?;
+                File::open(&self.input).map_err(|_| Error::UnableToOpenFile(self.input.clone()))?;
 
             let mut read = 0;
 
             match self.block_count {
                 Some(count) => {
-                    let mut counter = 0;
-                    while counter < count {
+                    for _ in 0..count {
                         let mut tmp_buf = vec![0; self.block_size];
                         read += file
                             .read(&mut tmp_buf)
-                            .map_err(|_| Error::UnableToReadBytesFrom(input_path.clone()))?;
+                            .map_err(|_| Error::UnableToReadBytesFrom(self.input.clone()))?;
                         message_bus.broadcast(tmp_buf);
-
-                        counter += 1;
                     }
                 }
                 None => {
-                    let input = input_path.clone();
+                    let full_len = file
+                        .stream_len()
+                        .map_err(|_| Error::UnableToGetByteLen(self.input.clone()))?;
+
                     loop {
                         let curr_pos = file
                             .stream_position()
-                            .map_err(|_| Error::UnableToGetCurrPos(input.clone()))?;
-
-                        let full_len = file
-                            .stream_len()
-                            .map_err(|_| Error::UnableToGetByteLen(input.clone()))?;
+                            .map_err(|_| Error::UnableToGetCurrPos(self.input.clone()))?;
 
                         if curr_pos < full_len {
                             let diff = (full_len - curr_pos) as usize;
@@ -108,7 +105,7 @@ impl Diode {
 
                             read += file
                                 .read(&mut tmp_buf)
-                                .map_err(|_| Error::UnableToReadBytesFrom(input.clone()))?;
+                                .map_err(|_| Error::UnableToReadBytesFrom(self.input.clone()))?;
                             message_bus.broadcast(tmp_buf);
                         } else {
                             break;
@@ -138,11 +135,6 @@ impl Diode {
     }
 }
 
-struct Status {
-    bytes_copied: usize,
-    num_of_files: usize,
-}
-
 #[derive(Error, Debug)]
 enum Error {
     #[error("Error ocuured while writing to buffer.")]
@@ -163,13 +155,27 @@ enum Error {
     FailedToJoinThreads,
 }
 
+struct Status {
+    bytes_copied: usize,
+    num_of_files: usize,
+}
+
 impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} bytes copied to {} files.",
-            self.bytes_copied, self.num_of_files
-        )
+        let convert_bytes = |bytes: usize| -> (usize, &str) {
+            if bytes < 1024 {
+                (bytes, "bytes")
+            } else if bytes < 1024 * 1024 {
+                (bytes / 1024, "KB")
+            } else if bytes < 1024 * 1024 * 1024 {
+                (bytes / (1024 * 1024), "MB")
+            } else {
+                (bytes / (1024 * 1024 * 1024), "GB")
+            }
+        };
+
+        let (size, unit) = convert_bytes(self.bytes_copied);
+        write!(f, "{size} {unit} copied to {} files.", self.num_of_files)
     }
 }
 
