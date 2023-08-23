@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 argh = "0.1.12"
+bus = "2.4.1"
+thiserror = "1.0.47"
